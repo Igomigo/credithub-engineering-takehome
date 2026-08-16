@@ -12,7 +12,16 @@ and ticking the event off — is the candidate's task.
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Enum, Float, ForeignKey, Integer, String
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+)
 from sqlalchemy.orm import relationship
 
 from .db import Base
@@ -60,6 +69,17 @@ class PaymentEvent(Base):
     It is intentionally NOT unique at the DB level: real rails redeliver, so the
     same ``external_ref`` can arrive more than once, and de-duplicating is part
     of the task.
+
+    De-duplication is enforced by ``uq_applied_external_ref`` below rather than
+    by an application-level lookup. A ``SELECT`` for an existing ref followed by
+    an ``INSERT`` is check-then-act: two redeliveries arriving together both see
+    no match and both apply, double-crediting the borrower. The database is the
+    only thing that can arbitrate between concurrent writers, so we let it — a
+    losing writer gets an ``IntegrityError``, which *is* the duplicate signal.
+
+    The index is *partial* — scoped to ``applied`` rows — because the contract
+    requires recording every incoming payment, including the redeliveries we
+    reject. A full unique index would block writing those rejection rows.
     """
 
     __tablename__ = "payment_events"
@@ -73,6 +93,18 @@ class PaymentEvent(Base):
     reason = Column(String, nullable=True)  # why it was rejected, if it was
     received_at = Column(DateTime, default=_utcnow)
     processed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        # At most one *applied* event per external_ref. Rejected duplicates are
+        # still recorded, so the constraint cannot cover every row.
+        Index(
+            "uq_applied_external_ref",
+            "external_ref",
+            unique=True,
+            sqlite_where=(status == PaymentStatus.applied),
+            postgresql_where=(status == PaymentStatus.applied),
+        ),
+    )
 
 
 class Repayment(Base):
