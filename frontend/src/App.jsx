@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useState } from "react";
+import AdminPanel from "./components/AdminPanel";
+import { describeReason } from "./reasons";
 import "./styles.css";
 
-// This whole screen is PROVIDED. It fires synthetic payments at the webhook and
-// shows the feed + live loan balances. Your task is the backend webhook that
-// reconciles each payment on receipt — POST /webhooks/payments. Once you build
-// it, "Simulate incoming payment" will show payments getting applied/rejected
-// and the balances updating here. (The token below mirrors app/auth.py.)
+// Servicing console. The feed and loan balances below are the provided screen,
+// left as they were — the raw log is the right tool for tracing one reference.
+// The admin panel above it is the operator's view: what needs attention now.
+// (The token below mirrors app/auth.py.)
 
 const WEBHOOK_TOKEN = "dev-webhook-secret";
 
@@ -21,6 +22,7 @@ const PAY_LABEL = { pending: "Pending", applied: "Applied", rejected: "Rejected"
 export default function App() {
   const [loans, setLoans] = useState(null);
   const [events, setEvents] = useState(null);
+  const [auditEntries, setAuditEntries] = useState([]);
   const [error, setError] = useState(null);
   const [note, setNote] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -33,6 +35,14 @@ export default function App() {
     ])
       .then(([l, e]) => { setLoans(l); setEvents(e); })
       .catch((err) => setError(String(err.message || err)));
+
+    // Fetched separately: the trail is supplementary, and losing it should not
+    // blank out the balances and the issues queue, which are what the screen
+    // is for.
+    fetch("/audit-log")
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setAuditEntries)
+      .catch(() => setAuditEntries([]));
   }, []);
 
   useEffect(load, [load]);
@@ -103,10 +113,13 @@ export default function App() {
         <div className="stat"><div className="k">Payments received</div><div className="v">{events ? eventList.length : "—"}</div></div>
       </div>
 
-      {/* Payments feed */}
+      {events && <AdminPanel events={eventList} auditEntries={auditEntries} />}
+
+      {/* Payments feed — provided screen, unchanged */}
+      <div className="section-title">Payments feed</div>
       <div className="card">
         <div className="card-h">
-          <span>Payments feed</span>
+          <span className="muted issue-subtitle">Every payment received, newest first</span>
           <button className="btn btn-primary" onClick={simulate} disabled={busy || !loans}>
             {busy ? "Sending…" : "Simulate incoming payment"}
           </button>
@@ -138,7 +151,7 @@ export default function App() {
                   <td className="num">{ngn.format(e.amount)}</td>
                   <td>
                     <span className={`pbadge ${e.status}`}>{PAY_LABEL[e.status] || e.status}</span>
-                    {e.reason ? <div className="chan">{e.reason}</div> : null}
+                    {e.reason ? <div className="chan">{describeReason(e.reason).label}</div> : null}
                   </td>
                   <td className="num">
                     <button className="btn" onClick={() => resend(e)} disabled={busy} title="Redeliver this payment">
@@ -189,18 +202,6 @@ export default function App() {
         </table>
       </div>
 
-      <div className="todo">
-        <h3>Your task</h3>
-        This screen is provided. <b>Core:</b> build{" "}
-        <code>POST /webhooks/payments</code> so an incoming payment is reconciled{" "}
-        <b>on receipt</b> — recorded, matched to its loan, applied (or rejected),
-        the loan closed when fully repaid, audited, in one transaction. Handle a
-        rail <b>redelivery</b> (the <b>Resend&nbsp;↻</b> button re-fires the same
-        reference — it must not apply twice), a payment for a closed loan, and
-        overpayment. <b>Extension:</b> build an <b>admin reconciliation &amp; issues
-        panel</b> that showcases what reconciled and the issues needing attention.
-        See <code>README.md</code>.
-      </div>
     </div>
   );
 }
