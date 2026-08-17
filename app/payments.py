@@ -1,13 +1,13 @@
 """Payment ingestion + reconciliation.
 
-Provided (working): the payments feed (``GET /payment-events``).
+``GET /payment-events`` is the feed. ``POST /webhooks/payments`` is where a
+rail (gateway/GSI/CBS) hands us a payment: it is recorded, matched to its loan,
+and applied or rejected in the same call — there is no separate "apply" step.
 
->>> YOUR TASK is the webhook that reconciles an incoming payment ON RECEIPT —
-    ``POST /webhooks/payments``. See the stub at the bottom and README.md. <<<
-
-The frontend's "Simulate incoming payment" button POSTs a synthetic payment to
-this webhook — exactly as a real gateway/rail would. There is no separate
-"apply" step: a payment arrives and is reconciled in the same call.
+The module is arranged so that deciding and doing stay apart:
+``_rejection_reason`` is the entire reconciliation policy and touches nothing,
+``_apply``/``_reject`` only persist, and the route wires them together inside a
+single transaction.
 """
 
 from datetime import datetime, timezone
