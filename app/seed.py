@@ -9,6 +9,7 @@ so the feed isn't empty on first load. New payments arrive via the webhook (the
 
 from .db import Base, SessionLocal, engine
 from .models import Loan, LoanStatus, PaymentEvent, PaymentStatus
+from .payments import RejectionReason
 
 
 def seed() -> None:
@@ -31,8 +32,10 @@ def seed() -> None:
     events = [
         PaymentEvent(external_ref="PSK-8001", loan_id=2, amount=28000, channel="paystack", status=PaymentStatus.applied),
         PaymentEvent(external_ref="PSK-8002", loan_id=3, amount=224000, channel="gsi", status=PaymentStatus.applied),
+        # Reason codes must match RejectionReason in payments.py — the admin
+        # panel groups on them, and free text would land in "unclassified".
         PaymentEvent(external_ref="PSK-8003", loan_id=4, amount=5000, channel="cbs",
-                     status=PaymentStatus.rejected, reason="loan is cancelled, not active"),
+                     status=PaymentStatus.rejected, reason=RejectionReason.LOAN_NOT_ACTIVE),
     ]
     db.add_all(events)
     db.commit()
