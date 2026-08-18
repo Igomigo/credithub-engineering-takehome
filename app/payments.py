@@ -13,7 +13,7 @@ single transaction.
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from .audit import record_audit
@@ -51,6 +51,27 @@ class PaymentIn(BaseModel):
     loan_id: int
     amount: float = Field(gt=0)
     channel: str = "paystack"
+
+    @field_validator("external_ref")
+    @classmethod
+    def _ref_must_not_be_blank(cls, value: str) -> str:
+        # A whitespace-only reference passes min_length but is useless as an
+        # idempotency key: it cannot identify the payment on redelivery.
+        if not value.strip():
+            raise ValueError("external_ref must not be blank")
+        return value
+
+    @field_validator("amount")
+    @classmethod
+    def _amount_must_be_whole_kobo(cls, value: float) -> float:
+        # NGN has no denomination below the kobo. Accepting 100.005 would
+        # credit 100.00 while recording 100.005 on the event and the ledger,
+        # so the books would disagree with the balance by half a kobo; 0.004
+        # would report "applied" having moved nothing at all. Refuse it and
+        # let the rail send an amount we can record faithfully.
+        if round(value, 2) != value:
+            raise ValueError("amount must be a whole number of kobo")
+        return value
 
 
 def _event_out(e: PaymentEvent) -> dict:

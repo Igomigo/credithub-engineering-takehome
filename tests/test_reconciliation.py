@@ -416,6 +416,29 @@ def test_non_positive_amounts_are_refused(client, amount):
     assert pay(client, "BAD-1", 1, amount).status_code == 422
 
 
-def test_blank_external_ref_is_refused(client):
-    """Without a reference there is no idempotency key, so it cannot be safe."""
-    assert pay(client, "", 1, 100).status_code == 422
+@pytest.mark.parametrize("external_ref", ["", "   ", "\t\n"])
+def test_blank_external_ref_is_refused(client, external_ref):
+    """Without a reference there is no idempotency key, so it cannot be safe.
+
+    Whitespace counts as blank: it satisfies a length check but cannot
+    identify the payment when the rail redelivers it.
+    """
+    assert pay(client, external_ref, 1, 100).status_code == 422
+
+
+@pytest.mark.parametrize("amount", [0.004, 100.005, 0.001])
+def test_sub_kobo_amounts_are_refused(client, amount):
+    """NGN has no denomination below the kobo, so these cannot be recorded.
+
+    Accepting 100.005 would credit 100.00 while storing 100.005 on the event
+    and the ledger, leaving the books half a kobo adrift from the balance.
+    Worse, 0.004 rounds to nothing: it reported "applied" and wrote a ledger
+    row having moved no money at all.
+    """
+    assert pay(client, "SUBKOBO-1", 1, amount).status_code == 422
+
+
+def test_one_kobo_is_still_a_valid_payment(client):
+    """The smallest real amount must not be caught by the sub-kobo guard."""
+    assert pay(client, "KOBO-1", 1, 0.01).json()["event"]["status"] == "applied"
+    assert client.get("/loans/1").json()["total_paid"] == 0.01
