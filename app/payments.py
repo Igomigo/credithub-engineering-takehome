@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
 from .audit import record_audit
-from .auth import require_webhook_token
+from .auth import require_webhook_auth
 from .db import get_db
 from .models import Loan, LoanStatus, PaymentEvent, PaymentStatus, Repayment
 from .money import to_kobo, to_naira
@@ -190,7 +190,7 @@ def _reject(db, event: PaymentEvent, reason: str) -> None:
 def receive_payment(
     body: PaymentIn,
     db=Depends(get_db),
-    _token: str = Depends(require_webhook_token),
+    _auth: str = Depends(require_webhook_auth),
 ):
     """Reconcile an incoming payment on receipt.
 
