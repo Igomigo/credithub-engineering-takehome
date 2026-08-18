@@ -12,7 +12,7 @@ single transaction.
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
@@ -25,6 +25,11 @@ from .money import to_kobo, to_naira
 router = APIRouter()
 
 WEBHOOK_ACTOR = "payment-webhook"
+
+# Retries only happen when another payment settles against the same loan
+# mid-flight, which is rare and self-resolving. A small ceiling keeps a hot
+# loan from tying up a worker indefinitely.
+MAX_RECONCILE_ATTEMPTS = 3
 
 
 class RejectionReason:
@@ -70,16 +75,12 @@ def list_payment_events(db=Depends(get_db)):
 
 
 def _lock_loan(db, loan_id: int) -> Loan | None:
-    """Fetch the loan for update, so a concurrent payment cannot interleave.
+    """Fetch the loan, holding a row lock where the database supports one.
 
-    Without the lock, two payments against the same loan both read the same
-    ``total_paid``, both compute a new total from that stale figure, and the
-    second write silently discards the first — money the borrower paid simply
-    disappears.
-
-    ``with_for_update()`` is a no-op on SQLite, which serialises writers at the
-    file level anyway; it is what makes this correct on the Postgres the real
-    platform runs. See NOTES.md.
+    On Postgres this serialises payments against the same loan, so the retry
+    in ``_apply`` should rarely trigger. On SQLite it compiles to a plain
+    SELECT — SQLAlchemy drops the clause silently — which is why correctness
+    cannot rest on it. ``_apply`` is what actually guarantees the balance.
     """
     return (
         db.query(Loan)
@@ -137,17 +138,34 @@ def _rejection_reason(
     return None
 
 
-def _apply(db, event: PaymentEvent, loan: Loan, amount_kobo: int) -> None:
+def _apply(db, event: PaymentEvent, loan: Loan, amount_kobo: int) -> bool:
     """Credit the payment to the loan, closing it if that settles the debt.
 
-    Balances are recomputed in kobo, never by adding floats to floats, so a
-    part-paid loan still lands exactly on zero. The float columns are written
-    once, at the end, as storage.
+    Returns ``False`` if another payment changed the balance first; nothing is
+    written and the caller retries.
+
+    The UPDATE only matches while ``total_paid`` is still what we read, so a
+    payment that raced us cannot be overwritten. Adding in kobo (rather than
+    letting SQL add the floats) is what keeps an instalment-paid loan landing
+    exactly on zero.
     """
-    total_paid_kobo = to_kobo(loan.total_paid) + amount_kobo
-    loan.total_paid = to_naira(total_paid_kobo)
-    if total_paid_kobo >= to_kobo(loan.total_repayable):
-        loan.status = LoanStatus.paid_off
+    previous_paid = loan.total_paid
+    total_paid_kobo = to_kobo(previous_paid) + amount_kobo
+    settled = total_paid_kobo >= to_kobo(loan.total_repayable)
+
+    updated = (
+        db.query(Loan)
+        .filter(Loan.id == loan.id, Loan.total_paid == previous_paid)
+        .update(
+            {
+                Loan.total_paid: to_naira(total_paid_kobo),
+                Loan.status: LoanStatus.paid_off if settled else loan.status,
+            },
+            synchronize_session=False,
+        )
+    )
+    if updated == 0:
+        return False
 
     db.add(Repayment(loan_id=loan.id, payment_event_id=event.id, amount=event.amount))
     event.status = PaymentStatus.applied
@@ -161,9 +179,11 @@ def _apply(db, event: PaymentEvent, loan: Loan, amount_kobo: int) -> None:
         actor=WEBHOOK_ACTOR,
         detail=(
             f"{event.external_ref} via {event.channel}: applied "
-            f"{event.amount:.2f}; loan now {loan.status.value}"
+            f"{event.amount:.2f}; loan now "
+            f"{(LoanStatus.paid_off if settled else loan.status).value}"
         ),
     )
+    return True
 
 
 def _reject(db, event: PaymentEvent, reason: str) -> None:
@@ -205,6 +225,25 @@ def receive_payment(
     two commits leaves a payment recorded but never applied, and the books no
     longer balance.
     """
+    for _ in range(MAX_RECONCILE_ATTEMPTS):
+        event = _reconcile_once(db, body)
+        if event is not None:
+            break
+        # Another payment settled against this loan between our read and our
+        # write. Nothing was written; read the new balance and decide again.
+        db.rollback()
+    else:
+        # Only reachable under sustained contention on one loan. Better to let
+        # the rail redeliver than to guess at a balance we could not read
+        # cleanly.
+        raise HTTPException(status_code=503, detail="loan busy, please retry")
+
+    db.refresh(event)
+    return {"event": _event_out(event), "loan": _loan_snapshot(db, body.loan_id)}
+
+
+def _reconcile_once(db, body: PaymentIn) -> PaymentEvent | None:
+    """One attempt. ``None`` means the loan balance moved; the caller retries."""
     amount_kobo = to_kobo(body.amount)
     loan = _lock_loan(db, body.loan_id)
 
@@ -219,7 +258,8 @@ def receive_payment(
 
     reason = _rejection_reason(loan, amount_kobo, _already_applied(db, body.external_ref))
     if reason is None:
-        _apply(db, event, loan, amount_kobo)
+        if not _apply(db, event, loan, amount_kobo):
+            return None
     else:
         _reject(db, event, reason)
 
@@ -231,9 +271,7 @@ def receive_payment(
         # rejected duplicate in its own transaction.
         db.rollback()
         event = _record_duplicate(db, body)
-
-    db.refresh(event)
-    return {"event": _event_out(event), "loan": _loan_snapshot(db, body.loan_id)}
+    return event
 
 
 def _record_duplicate(db, body: PaymentIn) -> PaymentEvent:

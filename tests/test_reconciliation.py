@@ -203,10 +203,10 @@ def test_database_rejects_a_second_applied_row_for_one_reference(client):
     """The constraint itself, at the level the application cannot reach.
 
     ``uq_applied_external_ref`` is what protects against two redeliveries
-    racing — the case where both requests run their lookup before either
-    commits. SQLite serialises writers, so an HTTP-level concurrency test
-    cannot demonstrate the constraint is present; writing the rows directly
-    can.
+    racing, where both requests run their lookup before either commits. An
+    endpoint test cannot prove the index is present, because the lookup in
+    ``_already_applied`` would cover for its absence; writing the rows
+    directly isolates it.
     """
     db = SessionLocal()
     try:
@@ -228,15 +228,69 @@ def test_database_rejects_a_second_applied_row_for_one_reference(client):
         db.close()
 
 
+def test_two_payments_on_one_loan_do_not_lose_an_update(client):
+    """Two *different* payments settling against one loan at the same moment.
+
+    Distinct from a redelivery: both are legitimate and both must land. The
+    naive shape reads total_paid into Python, adds, and writes it back, so both
+    requests read the same balance and the second write discards the first —
+    both report success, both write a ledger row, and the borrower's money
+    silently vanishes from the balance.
+
+    This reproduces on SQLite: ``with_for_update()`` compiles to a plain SELECT
+    here because the dialect has no row-lock syntax, so the lock cannot be what
+    prevents it. The conditional UPDATE in ``_apply`` is.
+    """
+    barrier = threading.Barrier(2)
+
+    def fire(ref, amount):
+        barrier.wait()
+        pay(client, ref, 1, amount)
+
+    threads = [
+        threading.Thread(target=fire, args=args)
+        for args in [("LOST-1", 20000), ("LOST-2", 15000)]
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert client.get("/loans/1").json()["total_paid"] == 35000
+    db = SessionLocal()
+    assert db.query(Repayment).count() == 2
+    db.close()
+
+
+def test_racing_payments_are_re_checked_against_the_new_balance(client):
+    """A retry must decide again, not replay its first decision.
+
+    Loan #1 owes 56,000. Three payments of 20,000 arrive together: two fit,
+    the third overpays once the others land. If a retry reapplied its original
+    verdict, the loan would be overpaid.
+    """
+    barrier = threading.Barrier(3)
+
+    def fire(i):
+        barrier.wait()
+        pay(client, f"TRIPLE-{i}", 1, 20000)
+
+    threads = [threading.Thread(target=fire, args=(i,)) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    loan = client.get("/loans/1").json()
+    assert loan["total_paid"] == 40000
+    assert loan["outstanding"] == 16000
+
+
 def test_concurrent_redeliveries_credit_the_loan_once(client):
     """Two copies of one payment arriving together.
 
     A lookup-then-insert guard cannot catch this: both requests read before
     either commits, so both see no duplicate. Only the unique index can.
-
-    SQLite serialises writers at the file level, so this is a weaker test here
-    than it would be against Postgres — it demonstrates the constraint fires,
-    not that locking is correct under real concurrency. See NOTES.md.
     """
     barrier = threading.Barrier(2)
     statuses = []
